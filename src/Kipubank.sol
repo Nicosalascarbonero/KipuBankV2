@@ -4,318 +4,209 @@ pragma solidity ^0.8.20;
 // OpenZeppelin
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // Chainlink
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 /**
  * @title KipuBank
- * @dev Contrato bancario con soporte multi-token, límites en USD y contabilidad interna.
- * La contabilidad de saldos internos (s_balances) se mantiene en unidades nativas del token.
+ * @notice Contrato bancario con soporte multi-token, límites en USD y contabilidad interna.
+ * @dev Los saldos se mantienen en unidades nativas del token. Usa Chainlink para valoraciones en USD.
  */
 contract KipuBank is Ownable {
-    
+    using SafeERC20 for IERC20;
+
     // --- CONSTANTES Y VARIABLES INMUTABLES ---
-    
-    /// @dev Límite de retiro por transacción, en USD (ej. 100 USD).
-    uint256 public immutable WITHDRAWAL_LIMIT_USD; 
-    
-    /// @dev Límite global total del banco, en USD.
-    uint256 public immutable BANK_CAP_USD; 
-    
-    /// @dev La dirección del Price Feed de Chainlink para ETH/USD. INMUTABLE.
-    AggregatorV3Interface public immutable ETH_USD_PRICE_FEED;
+    uint256 public immutable WITHDRAWAL_LIMIT_USD; // Límite de retiro por transacción en USD
+    uint256 public immutable BANK_CAP_USD; // Límite global del banco en USD
+    AggregatorV3Interface public immutable ETH_USD_PRICE_FEED; // Price Feed de ETH/USD
 
-    // --- ALMACENAMIENTO MULTI-TOKEN Y VALORES DE CONTROL ---
-    
-    // Mapeo anidado: user => tokenAddress => balance (en unidades nativas del token)
-    mapping(address => mapping(address => uint256)) private s_balances;
-    
-    // Total de valor depositado en USD (para aplicar el BANK_CAP_USD). 
-    // NOTA: Debe ser actualizado con cada depósito/retiro de CUALQUIER token.
-    uint256 public totalDepositedUSD;
-    
-    // Mapeo para rastrear la dirección del Price Feed de Chainlink para cada token ERC-20.
-    mapping(address => AggregatorV3Interface) public tokenPriceFeeds;
-    
-    // Mapeo para almacenar los decimales de cada token ERC-20 (para la conversión).
-    mapping(address => uint8) public tokenDecimals;
-    
-    // --- REENTRANCY GUARD ---
-    uint256 private _status;
+    // --- ALMACENAMIENTO ---
+    mapping(address => mapping(address => uint256)) private s_balances; // user => token => balance
+    uint256 public totalDepositedUSD; // Total depositado en USD
+    mapping(address => AggregatorV3Interface) public tokenPriceFeeds; // Token => Price Feed
+    mapping(address => uint8) public tokenDecimals; // Token => Decimales
+    mapping(address => bool) public supportedTokens; // Lista blanca de tokens
+    bool private _locked; // Reentrancy guard
 
-    // --- ERRORES PERSONALIZADOS (Añadidos para Debugging) ---
-    error CapExceeded(uint256 availableSpaceUSD, uint256 depositAttemptUSD);
-    error InsufficientBalance(uint256 requested, uint256 available, address token);
+    // --- ERRORES ---
+    error CapExceeded(uint256 available, uint256 attempted);
+    error InsufficientBalance(uint256 requested, uint256 available);
     error WithdrawalLimitExceeded(uint256 requestedUSD, uint256 limitUSD);
-    error ZeroAmount(address token);
+    error ZeroAmount();
     error ReentrancyGuard();
-    error TransferFromFailed(address token, address from, uint256 amount);
-    error ExternalTransferFailed(address token, address recipient, uint256 amount);
+    error TransferFailed(address token, address to, uint256 amount);
     error ChainlinkCallFailed();
     error DecimalsNotSet(address token);
+    error UnsupportedToken(address token);
 
     // --- EVENTOS ---
-    event DepositSuccessful(address indexed user, address indexed token, uint256 amount, uint256 newBalance);
-    event WithdrawalSuccessful(address indexed user, address indexed token, uint256 amount, uint256 newBalance);
-    event EtherReceived(address indexed sender, uint256 amount);
-    event PriceFeedSet(address indexed token, address indexed feedAddress);
+    event Deposit(address indexed user, address indexed token, uint256 amount, uint256 newBalance);
+    event Withdrawal(address indexed user, address indexed token, uint256 amount, uint256 newBalance);
+    event TokenAdded(address indexed token, address indexed feedAddress, uint8 decimals);
 
     // --- MODIFICADORES ---
     modifier nonReentrant() {
-        if (_status != 0) {
-            revert ReentrancyGuard();
-        }
-        _status = 1;
+        if (_locked) revert ReentrancyGuard();
+        _locked = true;
         _;
-        _status = 0;
+        _locked = false;
     }
 
     // --- CONSTRUCTOR ---
     /**
-     * @dev Inicializa el contrato con límites en USD y la dirección del Price Feed de ETH.
+     * @notice Inicializa el contrato con límites en USD y Price Feed de ETH.
+     * @param bankCapUSD Límite global del banco en USD.
+     * @param withdrawalLimitUSD Límite de retiro por transacción en USD.
+     * @param ethPriceFeed Dirección del Price Feed de ETH/USD.
      */
-    constructor(
-        uint256 _bankCapUSD, 
-        uint256 _withdrawalLimitUSD,
-        address _ethPriceFeed
-    ) Ownable(msg.sender) {
-        BANK_CAP_USD = _bankCapUSD;
-        WITHDRAWAL_LIMIT_USD = _withdrawalLimitUSD;
-        ETH_USD_PRICE_FEED = AggregatorV3Interface(_ethPriceFeed);
+    constructor(uint256 bankCapUSD, uint256 withdrawalLimitUSD, address ethPriceFeed) Ownable(msg.sender) {
+        BANK_CAP_USD = bankCapUSD;
+        WITHDRAWAL_LIMIT_USD = withdrawalLimitUSD;
+        ETH_USD_PRICE_FEED = AggregatorV3Interface(ethPriceFeed);
+        supportedTokens[address(0)] = true; // ETH siempre soportado
+        tokenDecimals[address(0)] = 18; // Decimales de ETH
     }
-    
-    // -------------------------------------------------------------------------
-    //                              FUNCIONES ADMINISTRATIVAS
-    // -------------------------------------------------------------------------
-    
-    /**
-     * @notice Permite al dueño establecer el Price Feed para un nuevo token ERC-20.
-     * @dev Se requiere que los decimales del token ya estén establecidos.
-     */
-    function setTokenPriceFeed(address _token, address _feedAddress) external onlyOwner {
-        if (tokenDecimals[_token] == 0) {
-            // Nota: Este check asume que los decimales del token se establecen primero.
-            revert DecimalsNotSet(_token);
-        }
-        tokenPriceFeeds[_token] = AggregatorV3Interface(_feedAddress);
-        emit PriceFeedSet(_token, _feedAddress);
-    }
-    
-    /**
-     * @notice Permite al dueño establecer los decimales de un nuevo token ERC-20.
-     * @dev Los decimales son necesarios para la correcta valoración.
-     */
-    function setTokenDecimals(address _token, uint8 _decimals) external onlyOwner {
-        tokenDecimals[_token] = _decimals;
-    }
-    
-    // -------------------------------------------------------------------------
-    //                              FUNCIONES DE DEPÓSITO
-    // -------------------------------------------------------------------------
 
+    // --- FUNCIONES ADMINISTRATIVAS ---
+    /**
+     * @notice Agrega soporte para un nuevo token ERC-20.
+     * @param token Dirección del token.
+     * @param feedAddress Dirección del Price Feed de Chainlink.
+     * @param decimals Número de decimales del token.
+     */
+    function addSupportedToken(address token, address feedAddress, uint8 decimals) external onlyOwner {
+        if (decimals == 0) revert DecimalsNotSet(token);
+        supportedTokens[token] = true;
+        tokenPriceFeeds[token] = AggregatorV3Interface(feedAddress);
+        tokenDecimals[token] = decimals;
+        emit TokenAdded(token, feedAddress, decimals);
+    }
+
+    // --- FUNCIONES DE DEPÓSITO ---
+    /**
+     * @notice Recibe ETH y registra el depósito.
+     */
     receive() external payable {
-        _handleDeposit(address(0), msg.value);
-        emit EtherReceived(msg.sender, msg.value);
-    }
-
-    function depositETH() external payable {
-        _handleDeposit(address(0), msg.value);
+        _deposit(address(0), msg.value);
     }
 
     /**
-     * @notice Permite a un usuario depositar tokens ERC-20.
+     * @notice Deposita ETH.
      */
-    function depositERC20(address _token, uint256 _amount) external {
-        _handleDeposit(_token, _amount);
+    function depositETH() external payable nonReentrant {
+        _deposit(address(0), msg.value);
     }
-    
-    // -------------------------------------------------------------------------
-    //                              FUNCIONES DE RETIRO
-    // -------------------------------------------------------------------------
 
     /**
-     * @notice Permite retirar ETH o tokens ERC-20.
-     * @dev Sigue el patrón Checks-Effects-Interactions (CEI) y usa nonReentrant.
+     * @notice Deposita tokens ERC-20.
+     * @param token Dirección del token.
+     * @param amount Cantidad a depositar.
      */
-    function withdraw(address _token, uint256 _amount) external nonReentrant {
-        // --- Checks ---
-        if (_amount == 0) revert ZeroAmount(_token);
-        
-        uint256 userBalance = s_balances[msg.sender][_token];
-        if (_amount > userBalance) {
-             revert InsufficientBalance({
-                 requested: _amount,
-                 available: userBalance,
-                 token: _token
-             });
-        }
-        
-        // 1. Obtener la valoración en USD y aplicar límites
-        uint256 amountUSD = _getTokenValueInUSD(_token, _amount);
-        if (amountUSD > WITHDRAWAL_LIMIT_USD) {
-            revert WithdrawalLimitExceeded({
-                requestedUSD: amountUSD, 
-                limitUSD: WITHDRAWAL_LIMIT_USD
-            });
+    function depositERC20(address token, uint256 amount) external nonReentrant {
+        _deposit(token, amount);
+    }
+
+    /**
+     * @dev Lógica interna para depósitos.
+     * @param token Dirección del token (address(0) para ETH).
+     * @param amount Cantidad en unidades nativas.
+     */
+    function _deposit(address token, uint256 amount) private {
+        if (amount == 0) revert ZeroAmount();
+        if (!supportedTokens[token]) revert UnsupportedToken(token);
+
+        // Calcular valor en USD
+        uint256 depositUSD = _getTokenValueInUSD(token, amount);
+        uint256 newTotalUSD = totalDepositedUSD + depositUSD;
+        if (newTotalUSD > BANK_CAP_USD) revert CapExceeded(BANK_CAP_USD - totalDepositedUSD, depositUSD);
+
+        // Transferir tokens (si no es ETH)
+        if (token != address(0)) {
+            IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         }
 
-        // --- Effects ---
-        // 1. Reduce el balance interno del usuario
-        s_balances[msg.sender][_token] = userBalance - _amount;
-        
-        // 2. Reduce el valor total depositado en USD
-        // Utilizamos la misma valoración USD obtenida previamente para mantener la consistencia
-        totalDepositedUSD -= amountUSD; 
+        // Actualizar estado
+        s_balances[msg.sender][token] += amount;
+        totalDepositedUSD = newTotalUSD;
 
-        // --- Interactions / Events ---
-        if (_token == address(0)) {
-            _safeTransferEther(msg.sender, _amount);
+        emit Deposit(msg.sender, token, amount, s_balances[msg.sender][token]);
+    }
+
+    // --- FUNCIONES DE RETIRO ---
+    /**
+     * @notice Retira ETH o tokens ERC-20.
+     * @param token Dirección del token (address(0) para ETH).
+     * @param amount Cantidad a retirar.
+     */
+    function withdraw(address token, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (!supportedTokens[token]) revert UnsupportedToken(token);
+
+        uint256 balance = s_balances[msg.sender][token];
+        if (amount > balance) revert InsufficientBalance(amount, balance);
+
+        uint256 amountUSD = _getTokenValueInUSD(token, amount);
+        if (amountUSD > WITHDRAWAL_LIMIT_USD) revert WithdrawalLimitExceeded(amountUSD, WITHDRAWAL_LIMIT_USD);
+
+        // Actualizar estado
+        s_balances[msg.sender][token] = balance - amount;
+        totalDepositedUSD -= amountUSD;
+
+        // Transferir
+        if (token == address(0)) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            if (!success) revert TransferFailed(token, msg.sender, amount);
         } else {
-            _safeTransferERC20(_token, msg.sender, _amount);
+            IERC20(token).safeTransfer(msg.sender, amount);
         }
-        
-        emit WithdrawalSuccessful(msg.sender, _token, _amount, s_balances[msg.sender][_token]);
+
+        emit Withdrawal(msg.sender, token, amount, s_balances[msg.sender][token]);
     }
 
-    // -------------------------------------------------------------------------
-    //                             LÓGICA PRIVADA CENTRAL
-    // -------------------------------------------------------------------------
+    // --- FUNCIONES DE ORÁCULO ---
+    /**
+     * @notice Calcula el valor en USD de una cantidad de tokens.
+     * @param token Dirección del token (address(0) para ETH).
+     * @param amount Cantidad en unidades nativas.
+     * @return Valor en USD con 8 decimales.
+     */
+    function _getTokenValueInUSD(address token, uint256 amount) private view returns (uint256) {
+        AggregatorV3Interface priceFeed = token == address(0) ? ETH_USD_PRICE_FEED : tokenPriceFeeds[token];
+        uint8 decimals = token == address(0) ? 18 : tokenDecimals[token];
+
+        if (decimals == 0) revert DecimalsNotSet(token);
+
+        (, int256 price, , uint256 updatedAt, ) = priceFeed.latestRoundData();
+        if (price <= 0 || updatedAt == 0 || block.timestamp - updatedAt > 3600) revert ChainlinkCallFailed();
+
+        uint256 numerator = amount * uint256(price);
+        return decimals > 8
+            ? numerator / (10 ** (decimals - 8)) / 10**8
+            : numerator * (10 ** (8 - decimals)) / 10**8;
+    }
+
+    // --- FUNCIONES DE VISTA ---
+    /**
+     * @notice Consulta el saldo de un usuario para un token.
+     * @param user Dirección del usuario.
+     * @param token Dirección del token (address(0) para ETH).
+     * @return Saldo en unidades nativas.
+     */
+    function getBalance(address user, address token) external view returns (uint256) {
+        return s_balances[user][token];
+    }
 
     /**
-     * @dev Lógica central para depósitos (ETH o ERC-20). Aplica el BANK_CAP.
-     * @param _token La dirección del token (address(0) para ETH).
-     * @param _amount La cantidad de Ether/tokens recibida (en unidades nativas).
+     * @notice Consulta el precio más reciente de un token.
+     * @param token Dirección del token (address(0) para ETH).
+     * @return Precio en USD con 8 decimales.
      */
-    function _handleDeposit(address _token, uint256 _amount) private {
-        // --- Checks ---
-        if (_amount == 0) revert ZeroAmount(_token);
-        
-        // 1. Obtener la valoración en USD del depósito y aplicar el límite global (BANK_CAP)
-        uint256 depositUSD = _getTokenValueInUSD(_token, _amount);
-        if (totalDepositedUSD + depositUSD > BANK_CAP_USD) {
-            revert CapExceeded({
-                availableSpaceUSD: BANK_CAP_USD - totalDepositedUSD,
-                depositAttemptUSD: depositUSD
-            });
-        }
-        
-        // --- Effects ---
-        // 1. Si es ERC-20, transferir los tokens ANTES de actualizar el estado (CEI)
-        if (_token != address(0)) {
-            _transferInERC20(_token, _amount);
-        }
-        
-        // 2. Actualizar balance interno del usuario
-        s_balances[msg.sender][_token] += _amount;
-        
-        // 3. Actualizar el valor total en USD del banco
-        totalDepositedUSD += depositUSD;
-        
-        // --- Events ---
-        emit DepositSuccessful(msg.sender, _token, _amount, s_balances[msg.sender][_token]);
-    }
-
-    // -------------------------------------------------------------------------
-    //                             HELPERS DE ORÁCULOS Y CONVERSIÓN
-    // -------------------------------------------------------------------------
-    
-    /**
-     * @dev Obtiene el valor actual de un token (o ETH) en USD.
-     * @param _token La dirección del token (address(0) para ETH).
-     * @param _amount La cantidad de tokens/ETH en unidades nativas.
-     * @return El valor total en USD con 8 decimales.
-     */
-    function _getTokenValueInUSD(address _token, uint256 _amount) private view returns (uint256) {
-        AggregatorV3Interface priceFeed;
-        uint8 tokenDecimalsInternal;
-        
-        if (_token == address(0)) {
-            priceFeed = ETH_USD_PRICE_FEED;
-            tokenDecimalsInternal = 18; // ETH siempre tiene 18 decimales
-        } else {
-            // Requerir que el Price Feed y los decimales estén configurados
-            priceFeed = tokenPriceFeeds[_token];
-            tokenDecimalsInternal = tokenDecimals[_token];
-            if (tokenDecimalsInternal == 0) revert DecimalsNotSet(_token);
-        }
-
-        // Obtener el precio del oráculo (retorna un precio con 8 decimales)
-        (, int256 price, , , ) = priceFeed.latestRoundData();
-        if (price <= 0) revert ChainlinkCallFailed();
-        
-        // Normalizar la cantidad para el cálculo. El resultado final debe ser en USD (8 decimales)
-        // ValorUSD = (cantidad * precio) / 10^tokenDecimals
-        
-        // Usamos una biblioteca de FixedPointMath para cálculos seguros, pero por simplicidad de ejemplo:
-        
-        // 1. Multiplicar cantidad * precio (el resultado tendrá 18 + 8 = 26 decimales si fuera ETH)
-        uint256 numerator = _amount * uint256(price);
-        
-        // 2. Dividir por 10^tokenDecimals (normaliza la cantidad)
-        // El resultado final tiene (26 - tokenDecimals) decimales.
-        
-        // Queremos el resultado en 8 decimales (los decimales del precio Chainlink).
-        // Para tener 8 decimales al final:
-        // Si tokenDecimals < 8, multiplicamos por 10^(8 - tokenDecimals) para subir al precio feed
-        // Si tokenDecimals > 8, dividimos por 10^(tokenDecimals - 8)
-        
-        // Opción Simple (asumiendo que los tokens que se integran tienen decimales <= 18):
-        uint256 finalValueUSD;
-        if (tokenDecimalsInternal > 8) {
-             // Dividir por la diferencia de decimales (ej: 18 - 8 = 10)
-             finalValueUSD = numerator / (10 ** (tokenDecimalsInternal - 8)); 
-        } else if (tokenDecimalsInternal < 8) {
-             // Multiplicar por la diferencia (ej: 6 - 8 = -2. Multiplicar por 10^2)
-             finalValueUSD = numerator * (10 ** (8 - tokenDecimalsInternal));
-        } else { // tokenDecimalsInternal == 8
-             finalValueUSD = numerator;
-        }
-
-        return finalValueUSD / 10**8; // Dividir por 10^8 para obtener el resultado en la unidad básica del feed.
-    }
-    
-    // -------------------------------------------------------------------------
-    //                             HELPERS DE TRANSFERENCIA
-    // -------------------------------------------------------------------------
-    
-    /**
-     * @dev Realiza la transferencia de ERC-20 hacia el contrato (requiere aprobación previa).
-     */
-    function _transferInERC20(address _token, uint256 _amount) private {
-        bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
-        if (!success) {
-            revert TransferFromFailed({token: _token, from: msg.sender, amount: _amount});
-        }
-    }
-
-    /// @dev Envío seguro de Ether.
-    function _safeTransferEther(address _to, uint256 _amount) private {
-        (bool success, ) = payable(_to).call{value: _amount}("");
-        if (!success) {
-            revert ExternalTransferFailed({token: address(0), recipient: _to, amount: _amount});
-        }
-    }
-    
-    /// @dev Envío seguro de ERC-20.
-    function _safeTransferERC20(address _token, address _to, uint256 _amount) private {
-        bool success = IERC20(_token).transfer(_to, _amount);
-        if (!success) {
-            revert ExternalTransferFailed({token: _token, recipient: _to, amount: _amount});
-        }
-    }
-    
-    // -------------------------------------------------------------------------
-    //                             FUNCIONES DE VISTA
-    // -------------------------------------------------------------------------
-
-    function getBalance(address _user, address _token) external view returns (uint256) {
-        return s_balances[_user][_token];
-    }
-    
-    function getLatestPrice(address _token) external view returns (int256) {
-        AggregatorV3Interface priceFeed = (_token == address(0)) ? ETH_USD_PRICE_FEED : tokenPriceFeeds[_token];
-        (, int256 price, , , ) = priceFeed.latestRoundData();
+    function getLatestPrice(address token) external view returns (int256) {
+        AggregatorV3Interface priceFeed = token == address(0) ? ETH_USD_PRICE_FEED : tokenPriceFeeds[token];
+        (, int256 price, , uint256 updatedAt, ) = priceFeed.latestRoundData();
+        if (price <= 0 || updatedAt == 0 || block.timestamp - updatedAt > 3600) revert ChainlinkCallFailed();
         return price;
     }
 }
