@@ -85,7 +85,9 @@ contract KipuBank is Ownable {
         ETH_USD_PRICE_FEED = AggregatorV3Interface(_ethPriceFeed);
     }
     
-
+    // -------------------------------------------------------------------------
+    //                              FUNCIONES ADMINISTRATIVAS
+    // -------------------------------------------------------------------------
     
     /**
      * @notice Permite al dueño establecer el Price Feed para un nuevo token ERC-20.
@@ -176,7 +178,9 @@ contract KipuBank is Ownable {
         emit WithdrawalSuccessful(msg.sender, _token, _amount, s_balances[msg.sender][_token]);
     }
 
-  
+    // -------------------------------------------------------------------------
+    //                             LÓGICA PRIVADA CENTRAL
+    // -------------------------------------------------------------------------
 
     /**
      * @dev Lógica central para depósitos (ETH o ERC-20). Aplica el BANK_CAP.
@@ -251,9 +255,7 @@ contract KipuBank is Ownable {
         // 2. Dividir por 10^tokenDecimals (normaliza la cantidad)
         // El resultado final tiene (26 - tokenDecimals) decimales.
         
-        // resultado en 8 decimales (los decimales del precio Chainlink).
-        uint256 denominator = 10 ** tokenDecimalsInternal; 
-        
+        // Queremos el resultado en 8 decimales (los decimales del precio Chainlink).
         // Para tener 8 decimales al final:
         // Si tokenDecimals < 8, multiplicamos por 10^(8 - tokenDecimals) para subir al precio feed
         // Si tokenDecimals > 8, dividimos por 10^(tokenDecimals - 8)
